@@ -20,6 +20,9 @@
   },
   "dependencies": {
     "@neondatabase/serverless": "^0.10.4",
+    "@opentelemetry/api": "^1.9.1",
+    "@opentelemetry/auto-instrumentations-node": "^0.72.0",
+    "@opentelemetry/sdk-node": "^0.214.0",
     "better-auth": "^1.1.21",
     "classnames": "^2.5.1",
     "cors": "^2.8.5",
