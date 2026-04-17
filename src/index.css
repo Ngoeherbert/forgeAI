@@ -1,0 +1,57 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  background: #0b0b0d;
+  color: #c7c7cf;
+  font-feature-settings: "cv11", "ss01";
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-thumb {
+  background: #26262c;
+  border-radius: 8px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.prose-forge {
+  color: #c7c7cf;
+}
+.prose-forge p,
+.prose-forge li {
+  line-height: 1.6;
+}
+.prose-forge code {
+  background: #1b1b20;
+  padding: 0.12rem 0.35rem;
+  border-radius: 4px;
+  font-size: 0.86em;
+}
+.prose-forge pre {
+  background: #111114;
+  border: 1px solid #26262c;
+  padding: 12px;
+  border-radius: 8px;
+  overflow-x: auto;
+}
+.prose-forge a {
+  color: #3b82f6;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
