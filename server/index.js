@@ -23,8 +23,11 @@ app.use(
   }),
 );
 
+// Better-Auth's browser client hits /api/auth/* by default, so mount the
+// handler there. This must come BEFORE express.json() because Better-Auth
+// parses its own request bodies.
 if (auth) {
-  app.all("/auth/*", toNodeHandler(auth));
+  app.all("/api/auth/*", toNodeHandler(auth));
 }
 
 app.use(express.json({ limit: "2mb" }));

@@ -1,20 +1,25 @@
 import { Router } from "express";
-import { desc, eq } from "drizzle-orm";
+import { and, desc, eq } from "drizzle-orm";
 import { db, schema } from "../db/index.js";
 import { requireUser } from "../auth.js";
 
 const router = Router();
 
+async function userOrgId(userId) {
+  const m = await db.query.organizationMembers.findFirst({
+    where: eq(schema.organizationMembers.userId, userId),
+  });
+  return m?.organizationId ?? null;
+}
+
 router.get("/", async (req, res) => {
   const user = await requireUser(req, res);
   if (!user) return;
-  const m = await db.query.organizationMembers.findFirst({
-    where: eq(schema.organizationMembers.userId, user.id),
-  });
-  if (!m) return res.json({ knowledge: [] });
+  const orgId = await userOrgId(user.id);
+  if (!orgId) return res.json({ knowledge: [] });
 
   const rows = await db.query.knowledge.findMany({
-    where: eq(schema.knowledge.organizationId, m.organizationId),
+    where: eq(schema.knowledge.organizationId, orgId),
     orderBy: desc(schema.knowledge.updatedAt),
   });
   res.json({ knowledge: rows });
@@ -23,16 +28,14 @@ router.get("/", async (req, res) => {
 router.post("/", async (req, res) => {
   const user = await requireUser(req, res);
   if (!user) return;
-  const m = await db.query.organizationMembers.findFirst({
-    where: eq(schema.organizationMembers.userId, user.id),
-  });
-  if (!m) return res.status(400).json({ error: "No org" });
+  const orgId = await userOrgId(user.id);
+  if (!orgId) return res.status(400).json({ error: "No org" });
 
   const { title, body, trigger, repoScope, pinned } = req.body ?? {};
   const [row] = await db
     .insert(schema.knowledge)
     .values({
-      organizationId: m.organizationId,
+      organizationId: orgId,
       authorId: user.id,
       title,
       body,
@@ -47,18 +50,49 @@ router.post("/", async (req, res) => {
 router.patch("/:id", async (req, res) => {
   const user = await requireUser(req, res);
   if (!user) return;
+  const orgId = await userOrgId(user.id);
+  if (!orgId) return res.status(404).json({ error: "Not found" });
+
+  // Allow-list the mutable fields — never trust the request body to
+  // reassign organizationId / authorId / id.
+  const { title, body, trigger, repoScope, pinned } = req.body ?? {};
+  const patch = {
+    ...(title !== undefined ? { title } : {}),
+    ...(body !== undefined ? { body } : {}),
+    ...(trigger !== undefined ? { trigger } : {}),
+    ...(repoScope !== undefined ? { repoScope } : {}),
+    ...(pinned !== undefined ? { pinned: !!pinned } : {}),
+    updatedAt: new Date(),
+  };
+
   const [row] = await db
     .update(schema.knowledge)
-    .set({ ...req.body, updatedAt: new Date() })
-    .where(eq(schema.knowledge.id, req.params.id))
+    .set(patch)
+    .where(
+      and(
+        eq(schema.knowledge.id, req.params.id),
+        eq(schema.knowledge.organizationId, orgId),
+      ),
+    )
     .returning();
+  if (!row) return res.status(404).json({ error: "Not found" });
   res.json({ knowledge: row });
 });
 
 router.delete("/:id", async (req, res) => {
   const user = await requireUser(req, res);
   if (!user) return;
-  await db.delete(schema.knowledge).where(eq(schema.knowledge.id, req.params.id));
+  const orgId = await userOrgId(user.id);
+  if (!orgId) return res.status(404).json({ error: "Not found" });
+
+  await db
+    .delete(schema.knowledge)
+    .where(
+      and(
+        eq(schema.knowledge.id, req.params.id),
+        eq(schema.knowledge.organizationId, orgId),
+      ),
+    );
   res.status(204).end();
 });
 

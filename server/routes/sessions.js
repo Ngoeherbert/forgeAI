@@ -12,6 +12,28 @@ async function userOrgId(userId) {
   return m?.organizationId ?? null;
 }
 
+/**
+ * Load a session and confirm the current user belongs to the session's
+ * organization. Responds 404 if the session doesn't exist or the user
+ * isn't a member of its org (avoids leaking existence of other orgs'
+ * sessions via UUID enumeration).
+ */
+async function loadSessionForUser(req, res, user) {
+  const session = await db.query.agentSessions.findFirst({
+    where: eq(schema.agentSessions.id, req.params.id),
+  });
+  if (!session) {
+    res.status(404).json({ error: "Not found" });
+    return null;
+  }
+  const orgId = await userOrgId(user.id);
+  if (!orgId || orgId !== session.organizationId) {
+    res.status(404).json({ error: "Not found" });
+    return null;
+  }
+  return session;
+}
+
 router.get("/", async (req, res) => {
   const user = await requireUser(req, res);
   if (!user) return;
@@ -60,16 +82,17 @@ router.post("/", async (req, res) => {
 router.get("/:id", async (req, res) => {
   const user = await requireUser(req, res);
   if (!user) return;
-  const session = await db.query.agentSessions.findFirst({
-    where: eq(schema.agentSessions.id, req.params.id),
-  });
-  if (!session) return res.status(404).json({ error: "Not found" });
+  const session = await loadSessionForUser(req, res, user);
+  if (!session) return;
   res.json({ session });
 });
 
 router.patch("/:id", async (req, res) => {
   const user = await requireUser(req, res);
   if (!user) return;
+  const session = await loadSessionForUser(req, res, user);
+  if (!session) return;
+
   const { title, status, archivedAt } = req.body ?? {};
   const [updated] = await db
     .update(schema.agentSessions)
@@ -79,7 +102,7 @@ router.patch("/:id", async (req, res) => {
       ...(archivedAt !== undefined ? { archivedAt } : {}),
       updatedAt: new Date(),
     })
-    .where(eq(schema.agentSessions.id, req.params.id))
+    .where(eq(schema.agentSessions.id, session.id))
     .returning();
   res.json({ session: updated });
 });

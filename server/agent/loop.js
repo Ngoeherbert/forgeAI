@@ -17,6 +17,22 @@ const openai = new OpenAI({
 const MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
 const MAX_STEPS = Number(process.env.AGENT_MAX_STEPS || 24);
 
+/**
+ * Load persisted messages and reconstruct them into the format the
+ * OpenAI chat-completions API expects.
+ *
+ * Assistant messages that included tool_calls are stored in the DB in two
+ * possible shapes:
+ *   1. Batch (current): one row with `toolName === null` and `toolArgs`
+ *      as an array of `{id, name, arguments}` objects — one entry per
+ *      tool call in the original LLM response.
+ *   2. Legacy (pre-fix rows): one row per tool call with `toolName`
+ *      set to the function name and `toolArgs` as the argument object.
+ *
+ * The reconstructed API messages always look like:
+ *   assistant { tool_calls: [c1, c2, ...] } → tool{c1} → tool{c2} → ...
+ * which is the shape OpenAI requires.
+ */
 async function loadHistory(sessionId) {
   const rows = await db.query.messages.findMany({
     where: eq(schema.messages.sessionId, sessionId),
@@ -31,7 +47,36 @@ async function loadHistory(sessionId) {
         tool_call_id: m.toolCallId,
         content: JSON.stringify(m.toolResult ?? {}),
       });
-    } else if (m.role === "assistant" && m.toolName) {
+      continue;
+    }
+
+    if (m.role !== "assistant") {
+      msgs.push({ role: m.role, content: m.content });
+      continue;
+    }
+
+    // Batch row: toolArgs is an array of tool_call descriptors.
+    if (Array.isArray(m.toolArgs)) {
+      msgs.push({
+        role: "assistant",
+        content: m.content || null,
+        tool_calls: m.toolArgs.map((c) => ({
+          id: c.id,
+          type: "function",
+          function: {
+            name: c.name,
+            arguments:
+              typeof c.arguments === "string"
+                ? c.arguments
+                : JSON.stringify(c.arguments ?? {}),
+          },
+        })),
+      });
+      continue;
+    }
+
+    // Legacy single-tool-call row.
+    if (m.toolName) {
       msgs.push({
         role: "assistant",
         content: m.content || null,
@@ -46,23 +91,28 @@ async function loadHistory(sessionId) {
           },
         ],
       });
-    } else {
-      msgs.push({ role: m.role, content: m.content });
+      continue;
     }
+
+    // Plain assistant text.
+    msgs.push({ role: "assistant", content: m.content });
   }
   return msgs;
 }
 
-async function record(sessionId, row) {
-  const [m] = await db.insert(schema.messages).values({
-    sessionId,
-    role: row.role,
-    content: row.content ?? "",
-    toolCallId: row.toolCallId,
-    toolName: row.toolName,
-    toolArgs: row.toolArgs,
-    toolResult: row.toolResult,
-  }).returning();
+async function insertMessage(sessionId, row) {
+  const [m] = await db
+    .insert(schema.messages)
+    .values({
+      sessionId,
+      role: row.role,
+      content: row.content ?? "",
+      toolCallId: row.toolCallId ?? null,
+      toolName: row.toolName ?? null,
+      toolArgs: row.toolArgs ?? null,
+      toolResult: row.toolResult ?? null,
+    })
+    .returning();
   return m;
 }
 
@@ -105,18 +155,35 @@ export async function runAgentStep(sessionId, { emit } = {}) {
     const msg = choice.message;
 
     if (msg.tool_calls?.length) {
+      // Persist and push ONE assistant message containing ALL tool_calls
+      // from this completion, per OpenAI's required format.
+      const toolCallDescriptors = msg.tool_calls.map((call) => ({
+        id: call.id,
+        name: call.function.name,
+        arguments: safeJson(call.function.arguments),
+      }));
+
+      await insertMessage(sessionId, {
+        role: "assistant",
+        content: msg.content ?? "",
+        toolArgs: toolCallDescriptors,
+      });
+      emit?.({
+        type: "assistant_tool_call",
+        content: msg.content ?? "",
+        toolCalls: toolCallDescriptors,
+      });
+
+      messages.push({
+        role: "assistant",
+        content: msg.content ?? null,
+        tool_calls: msg.tool_calls,
+      });
+
+      // Execute each tool call and append tool result messages in order.
+      let finished = null;
       for (const call of msg.tool_calls) {
         const args = safeJson(call.function.arguments);
-        const assistantRow = {
-          role: "assistant",
-          content: msg.content ?? "",
-          toolCallId: call.id,
-          toolName: call.function.name,
-          toolArgs: args,
-        };
-        await record(sessionId, assistantRow);
-        emit?.({ type: "assistant_tool_call", ...assistantRow });
-
         const start = Date.now();
         let result;
         try {
@@ -135,7 +202,7 @@ export async function runAgentStep(sessionId, { emit } = {}) {
           durationMs,
         });
 
-        await record(sessionId, {
+        await insertMessage(sessionId, {
           role: "tool",
           content: "",
           toolCallId: call.id,
@@ -150,29 +217,28 @@ export async function runAgentStep(sessionId, { emit } = {}) {
         });
 
         messages.push({
-          role: "assistant",
-          content: msg.content ?? null,
-          tool_calls: [call],
-        });
-        messages.push({
           role: "tool",
           tool_call_id: call.id,
           content: JSON.stringify(result),
         });
 
         if (call.function.name === "finish") {
-          await db
-            .update(schema.agentSessions)
-            .set({ status: "sleeping", updatedAt: new Date() })
-            .where(eq(schema.agentSessions.id, sessionId));
-          emit?.({ type: "finished", summary: result.summary });
-          return { status: "finished", summary: result.summary };
+          finished = result;
         }
+      }
+
+      if (finished) {
+        await db
+          .update(schema.agentSessions)
+          .set({ status: "sleeping", updatedAt: new Date() })
+          .where(eq(schema.agentSessions.id, sessionId));
+        emit?.({ type: "finished", summary: finished.summary });
+        return { status: "finished", summary: finished.summary };
       }
       continue;
     }
 
-    await record(sessionId, {
+    await insertMessage(sessionId, {
       role: "assistant",
       content: msg.content ?? "",
     });
@@ -194,6 +260,8 @@ export async function runAgentStep(sessionId, { emit } = {}) {
 }
 
 function safeJson(s) {
+  if (s == null) return {};
+  if (typeof s !== "string") return s;
   try {
     return JSON.parse(s);
   } catch {
